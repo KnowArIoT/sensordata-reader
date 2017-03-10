@@ -1,2 +1,4 @@
+picamera
 pyserial
 requests
+boto3
