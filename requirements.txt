@@ -2,3 +2,4 @@ picamera
 pyserial
 requests
 boto3
+slackclient

@@ -6,6 +6,7 @@ import requests
 import re
 import json
 import datetime
+from slackclient import SlackClient
 
 from os import environ, remove
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,8 @@ SERIAL_DEVICE = "/dev/ttyACM0"
 S3_BUCKET_NAME = "ariot-bucket"
 IMAGES_URL = "https://s3-eu-west-1.amazonaws.com/{}".format(S3_BUCKET_NAME)
 
+SLACK_API_TOKEN = environ["SLACK_API_TOKEN"]
+
 SAMPLE_BUFFER_SIZE = 2
 CAMERA_TRIGGER_SLEEP = 1.0 # seconds
 CAMERA_TRIGGER_SENSITIFITY = 0.1
@@ -25,6 +28,8 @@ API_USER, API_PASS = environ["API_USER"], environ["API_PASS"]
 DATA_ENDPOINT = environ["API_URL"]
 SENSORDATA_ENDPOINT = "{}/save".format(DATA_ENDPOINT)
 IMAGE_META_ENDPOINT = "{}/s3".format(DATA_ENDPOINT)
+
+SLACK_CHANNEL = "#knowiot-pi3bot"
 
 API_SUPPORTED_SENSORS = [
 'u1',
@@ -173,6 +178,9 @@ def decode_line(line):
         if name not in API_SUPPORTED_SENSORS or len(data) == 0:
             return None
 
+        #if name in ["u1", "u2"]:
+            #print("{}: {}".format(name, data))
+
         global last_gps_lat_long
         if name == "gpsLatLong":
             last_gps_lat_long = data
@@ -183,8 +191,49 @@ def decode_line(line):
     except UnicodeDecodeError:
         return None
 
+def slack_post_msg(msg, sc):
+    return sc.api_call("chat.postMessage", channel=SLACK_CHANNEL, text=msg)
+   
+bot_start_time = time.time()
+def parse_message(event, sc):
+    if "content" not in event.keys():
+        return
+
+    message = event["content"]
+    if "@knowiotrpi3 snap" not in message:
+        return
+
+    if "event_ts" not in event or float(event["event_ts"]) < bot_start_time:
+        print("event is too old!")
+        return
+
+    img_name = capture_and_upload_image()
+    gmaps_link = "https://www.google.no/maps/dir/{}".format(last_gps_lat_long)
+    imgurl = "{} - {}/{}".format(gmaps_link, IMAGES_URL, img_name)
+    slack_post_msg(imgurl, sc)
+
+def slack_test():
+    sc = SlackClient(SLACK_API_TOKEN)
+    
+    ret = sc.api_call("channels.list", channel=SLACK_CHANNEL)
+    ret = sc.api_call("channels.join", channel=SLACK_CHANNEL)
+
+    slack_post_msg("hello", sc)
+
+    if not sc.rtm_connect():
+        print("Connection Failed, invalid token?")
+
+    while True:
+        events = sc.rtm_read()
+        print(events)
+        for event in events:
+            parse_message(event, sc)
+        time.sleep(1)
+
 def main():
     global last_send_time
+    ThreadPoolExecutor(max_workers=1).submit(slack_test)
+
     th = ThreadPoolExecutor(max_workers=1)
 
     with serial.Serial(SERIAL_DEVICE, 115200) as ser:
