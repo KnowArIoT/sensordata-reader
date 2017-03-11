@@ -8,5 +8,6 @@ def upload(bucket, src_filepath):
 
     dest_filename = os.path.basename(src_filepath)
     s3 = boto3.resource('s3')
-    s3.Bucket(bucket).put_object(Key=dest_filename, Body=data)
+    s3.Bucket(bucket).put_object(Key=dest_filename, Body=data, ACL='public-read')
 
+    return dest_filename

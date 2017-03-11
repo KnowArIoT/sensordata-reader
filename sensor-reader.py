@@ -4,23 +4,51 @@ import time
 import serial
 import requests
 import re
-import math
-from os import environ, remove
 import json
+import datetime
 
-#from camera import capture
+from os import environ, remove
+from concurrent.futures import ThreadPoolExecutor
+from camera import capture
 from s3 import upload
 
-DATA_ENDPOINT = environ["API_URL"]
 SEND_TIME_INTERVAL = 0.9
 SERIAL_DEVICE = "/dev/ttyACM0"
 S3_BUCKET_NAME = "ariot-bucket"
+IMAGES_URL = "https://s3-eu-west-1.amazonaws.com/{}".format(S3_BUCKET_NAME)
+
+SAMPLE_BUFFER_SIZE = 2
+CAMERA_TRIGGER_SLEEP = 1.0 # seconds
+CAMERA_TRIGGER_SENSITIFITY = 0.1
+
+API_USER, API_PASS = environ["API_USER"], environ["API_PASS"]
+DATA_ENDPOINT = environ["API_URL"]
+SENSORDATA_ENDPOINT = "{}/save".format(DATA_ENDPOINT)
+IMAGE_META_ENDPOINT = "{}/s3".format(DATA_ENDPOINT)
+
+API_SUPPORTED_SENSORS = [
+'u1',
+'u2',
+'gas',
+'mag',
+'accl',
+'gyro',
+#"gpsTime",
+#"gpsDate",
+#"gpsFix",
+#"gpsSignalQuality",
+"gpsLatLong",
+]
 
 sensor_data_buffer = []
 last_send_time = time.time()
+last_gps_lat_long = None
 
-def current_milli_time():
-    return int((time.time() - last_send_time) * 1000)
+def current_time():
+    t = time.time()
+    millisecs = int((t - last_send_time) * 1000)
+    date = datetime.datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d %H:%M:%S')
+    return date, millisecs
 
 def send_sensor_packet_buffered():
     global last_send_time
@@ -28,13 +56,32 @@ def send_sensor_packet_buffered():
     data = get_sensor_data()
     print("sending {} data points".format(len(data)))
 
-    print("post to {}".format(DATA_ENDPOINT))
-    resp = requests.post(DATA_ENDPOINT, json=data)
+    print("post to {}".format("{}".format(SENSORDATA_ENDPOINT)))
+    print(data[:3])
+    print("last gps latlong: {}".format(last_gps_lat_long))
+    resp = requests.post(SENSORDATA_ENDPOINT, json=data, auth=(API_USER, API_PASS))
+
     last_send_time = time.time()
+    #return
 
     print(resp.status_code)
     if resp.status_code != 200:
         print("Failed post sensor data")
+
+def send_image_meta(image_file_name, date, millisecs):
+    data = {
+        "url": "{}/{}".format(IMAGES_URL, image_file_name),
+        "latlong": last_gps_lat_long,
+        "time": date,
+        "miliseconds": millisecs
+    }
+
+    from json import dumps
+    print("sending image meta: {}".format(dumps(data)))
+    response = requests.post(IMAGE_META_ENDPOINT, data=data, auth=(API_USER, API_PASS))
+
+    if response.status_code != 200:
+        print("Failed to send image meta ({})".format(response.status_code))
 
 def put_sensor_data(data):
     global sensor_data_buffer
@@ -48,76 +95,108 @@ def get_sensor_data():
 
     return ret
 
-def is_float(num):
-    if re.match("^\d+?\.\d+?$", num) is None:
-        return False
-    return True
-
-def store_data(sensor_name, sensor_data, millisecs):
+def store_data(sensor_name, sensor_data, date, millisecs):
     if time.time() - last_send_time >= SEND_TIME_INTERVAL:
         send_sensor_packet_buffered()
-
-    if not is_float(sensor_data):
-        return
 
     sensor_packet = {
         "name": sensor_name,
         "data": sensor_data,
-        "time": millisecs
+        "time": date,
+        "milliseconds": millisecs
     }
 
     put_sensor_data(sensor_packet)
 
 def capture_and_upload_image():
     imgpath = capture()
-    upload(S3_BUCKET_NAME, imgpath)
+    dest_path = upload(S3_BUCKET_NAME, imgpath)
     remove(imgpath)
-    return imgpath
+    return dest_path
+
+class FixedFIFO:
+    def __init__(self, size):
+        self._size = size
+        self._buffer = []
+
+    def push(self, data):
+        self._buffer += [data]
+        if len(self._buffer) > self._size:
+            self._buffer.pop(0)
+
+    def avg(self):
+        return sum(self._buffer) / len(self._buffer)
+
+sample_buffer = FixedFIFO(SAMPLE_BUFFER_SIZE)
+last_sample_avg = 1
+last_trigger_time = time.time()
+
+sample_count = 0
+def process_sensordata(name, data, date, millisecs):
+    global last_trigger_time
+
+    if name not in ["u1"]:
+        return
+
+    global sample_count
+    global sample_buffer
+    global last_sample_avg
+
+    sample_buffer.push(float(data))
+    avg = sample_buffer.avg()
+
+    diff = abs(avg - last_sample_avg)
+
+    sample_count += 1
+    if sample_count % 50 == 0:
+        print("{}: {} {} {}".format(name, float(data), avg, diff))
+
+    last_sample_avg = avg
+
+    if diff < CAMERA_TRIGGER_SENSITIFITY or time.time() - last_trigger_time < CAMERA_TRIGGER_SLEEP:
+        return None
+
+    last_trigger_time = time.time()
+    img = capture_and_upload_image()
+
+    print("triggered camera ({})".format(diff))
+    send_image_meta(img, date, millisecs)
 
 def decode_line(line):
     try:
-        line = line.decode("utf-8").rstrip().split(":")
-        if len(line) != 2 or line[0] == "":
+        line = line.decode("utf-8").rstrip()
+        idx = line.find(":")
+        if idx < 0:
+            return None
+        name, data = line[:idx], line[idx + 1:].strip()
+
+        if name not in API_SUPPORTED_SENSORS or len(data) == 0:
             return None
 
-        name, data = line
-        return name, data, current_milli_time()
+        global last_gps_lat_long
+        if name == "gpsLatLong":
+            last_gps_lat_long = data
+            name = "gps"
+
+        date, millis = current_time()
+        return name, data.strip(), date, millis
     except UnicodeDecodeError:
         return None
 
-last_10 = []
-last_avg = 0
-def process_sensordata(name, data, millisecs): # {
-    if name != "u1":
-        return
-
-    last_10 += [data]
-    last_10.pop(0)
-
-    avg = sum(last_10) / len(last_10)
-
-    global last_avg
-    if math.abs(avg - last_avg) < 5:
-        return None
-
-    last_avg = avg
-    return capture_and_upload_image()
-# }
-
 def main():
     global last_send_time
-    #th = ThreadPoolExecutor(max_workers=1)
+    th = ThreadPoolExecutor(max_workers=1)
 
-    with serial.Serial(SERIAL_DEVICE) as ser:
+    with serial.Serial(SERIAL_DEVICE, 115200) as ser:
         last_send_time = time.time()
         while True:
             data = decode_line(ser.readline())
             if not data:
                 continue
-            store_data(*data)
 
+            process_sensordata(*data)
             #th.submit(process_sensordata, *data)
-            #th.submit(store_data, *data)
+            store_data(*data)
 
 if __name__ == "__main__":
     #print(capture_and_upload_image())
